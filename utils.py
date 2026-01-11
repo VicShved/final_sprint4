@@ -65,7 +65,7 @@ class MultimodalModel(nn.Module):
             nn.ReLU(),
             nn.Dropout(config.DROPOUT),
             # nn.Linear(config.HIDDEN_DIM, config.NUM_CLASSES),
-            nn.Linear(config.NUM_CLASSES, 1)      
+            nn.Linear(config.NUM_CLASSES, 1),      
         )
 
     def forward(self, input_ids, attention_mask, image, mass, text_id):
@@ -80,6 +80,18 @@ class MultimodalModel(nn.Module):
         fused_emb = torch.cat([image_features, mass, text_id], dim=1)
         mass = self.regressor(fused_emb)
         return mass
+    
+    @classmethod
+    def get_inputs(cls, batch, device):
+        return {
+            'input_ids': batch['input_ids'].to(device),
+            'attention_mask': batch['attention_mask'].to(device),
+            'image': batch['image'].to(device),
+            'mass': batch['mass'].unsqueeze(1).to(device),
+            "text_id": batch['text_id'].to(device)
+        }
+
+
 
 
 def train(config, device, n_rows=None):
@@ -139,13 +151,14 @@ def train(config, device, n_rows=None):
 
         for batch in train_loader:
             # Подготовка данных
-            inputs = {
-                'input_ids': batch['input_ids'].to(device),
-                'attention_mask': batch['attention_mask'].to(device),
-                'image': batch['image'].to(device),
-                'mass': batch['mass'].unsqueeze(1).to(device),
-                "text_id": batch['text_id'].to(device)
-            }
+            inputs = model.get_inputs(batch, device)
+            # inputs = {
+            #     'input_ids': batch['input_ids'].to(device),
+            #     'attention_mask': batch['attention_mask'].to(device),
+            #     'image': batch['image'].to(device),
+            #     'mass': batch['mass'].unsqueeze(1).to(device),
+            #     "text_id": batch['text_id'].to(device)
+            # }
             targets = batch['target'].unsqueeze(1).to(device)
 
             # Forward
@@ -184,13 +197,7 @@ def validate(model, val_loader, device, metric):
 
     with torch.no_grad():
         for batch in val_loader:
-            inputs = {
-                'input_ids': batch['input_ids'].to(device),
-                'attention_mask': batch['attention_mask'].to(device),
-                'image': batch['image'].to(device),
-                'mass': batch['mass'].unsqueeze(1).to(device),
-                "text_id": batch['text_id'].to(device)
-            }
+            inputs = model.get_inputs(batch, device)
             targets = batch['target'].unsqueeze(1).to(device)
 
             predicts = model(**inputs)
