@@ -1,4 +1,5 @@
 import torch
+from dataset import MultimodalDataset, get_transforms
 from utils import train
 
 
@@ -25,12 +26,24 @@ class Config:
     NUM_CLASSES = 4
 
     # Пути
-    TRAIN_DF_PATH = "data/imdb_train.csv"
-    VAL_DF_PATH = "data/imdb_val.csv"
+    DF_PATH = "data/dish.csv"
     SAVE_PATH = "best_model.pth"
 
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
-cfg = Config()
+config = Config()
 
-train(cfg, device)
+transforms = get_transforms(config=config)
+train_dataset = MultimodalDataset(config, transforms)
+print(train_dataset.df.head())
+train_dataset[1]
+
+# for i in range(len(train_dataset)):
+#     train_dataset[i]
+
+from dataset import plot_image
+
+row = train_dataset[len(train_dataset) - 1]
+plot_image(row['source_image'], row['image'])
+
+# train(config, device)

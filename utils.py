@@ -47,68 +47,75 @@ def set_requires_grad(module: nn.Module, unfreeze_pattern="", verbose=False):
 class MultimodalModel(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.text_model = AutoModel.from_pretrained(config.TEXT_MODEL_NAME)
+        # self.text_model = AutoModel.from_pretrained(config.TEXT_MODEL_NAME)
         self.image_model = timm.create_model(
             config.IMAGE_MODEL_NAME,
             pretrained=True,
-            num_classes=0
+            num_classes=0,
+            # out_indices=[5,6]
         )
 
-        self.text_proj = nn.Linear(self.text_model.config.hidden_size, config.HIDDEN_DIM)
-        self.image_proj = nn.Linear(self.image_model.num_features, config.HIDDEN_DIM)
-
-        self.classifier = nn.Sequential(
-            nn.Linear(config.HIDDEN_DIM, config.HIDDEN_DIM // 2),
-            nn.LayerNorm(config.HIDDEN_DIM // 2),
+        # self.text_proj = nn.Linear(self.text_model.config.hidden_size, config.HIDDEN_DIM)
+        # self.image_proj = nn.Linear(self.image_model.num_features, config.HIDDEN_DIM)
+        # self.mass_layer = nn.Linear(1, config.HIDDEN_DIM)
+        self.regressor = nn.Sequential(
+            nn.Linear(self.image_model.num_features + 1 + config.NUM_CLASSES, config.NUM_CLASSES),
+            # nn.LayerNorm(config.NUM_CLASSES),
+            # nn.BatchNorm1d(config.NUM_CLASSES),
             nn.ReLU(),
-            nn.Dropout(0.15),
-            nn.Linear(config.HIDDEN_DIM // 2, config.NUM_CLASSES)
+            nn.Dropout(config.DROPOUT),
+            # nn.Linear(config.HIDDEN_DIM, config.NUM_CLASSES),
+            nn.Linear(config.NUM_CLASSES, 1)      
         )
 
-    def forward(self, input_ids, attention_mask, image):
-        text_features = self.text_model(input_ids, attention_mask).last_hidden_state[:,  0, :]
+    def forward(self, input_ids, attention_mask, image, mass, text_id):
+        # text_features = self.text_model(input_ids, attention_mask).last_hidden_state[:,  0, :]
         image_features = self.image_model(image)
 
-        text_emb = self.text_proj(text_features)
-        image_emb = self.image_proj(image_features)
+        # text_emb = self.text_proj(text_features)
+        # mass_emb = self.mass_layer(mass)
+        # image_emb = self.image_proj(image_features)
 
-        fused_emb = text_emb * image_emb
+        # fused_emb = image_emb * mass_emb # * text_emb
+        fused_emb = torch.cat([image_features, mass, text_id], dim=1)
+        mass = self.regressor(fused_emb)
+        return mass
 
-        logits = self.classifier(fused_emb)
-        return logits
 
-
-def train(config, device):
+def train(config, device, n_rows=None):
     seed_everything(config.SEED)
 
     # Инициализация модели
     model = MultimodalModel(config).to(device)
     tokenizer = AutoTokenizer.from_pretrained(config.TEXT_MODEL_NAME)
 
-    set_requires_grad(model.text_model,
-                      unfreeze_pattern=config.TEXT_MODEL_UNFREEZE, verbose=True)
+    # set_requires_grad(model.text_model,
+    #                   unfreeze_pattern=config.TEXT_MODEL_UNFREEZE, verbose=True)
     set_requires_grad(model.image_model,
                       unfreeze_pattern=config.IMAGE_MODEL_UNFREEZE, verbose=True)
 
     # Оптимизатор с разными LR
-    optimizer = AdamW([{
-        'params': model.text_model.parameters(),
-        'lr': config.TEXT_LR
-    }, {
+    optimizer = AdamW([
+    # {
+    #     'params': model.text_model.parameters(),
+    #     'lr': config.TEXT_LR
+    # }, 
+    {
         'params': model.image_model.parameters(),
         'lr': config.IMAGE_LR
-    }, {
-        'params': model.classifier.parameters(),
-        'lr': config.CLASSIFIER_LR
+    }, 
+    {
+        'params': model.regressor.parameters(),
+        'lr': config.REGRESSOR_LR
     }])
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.L1Loss(reduction="mean")
 
     # Загрузка данных
     transforms = get_transforms(config)
     val_transforms = get_transforms(config, ds_type="val")
-    train_dataset = MultimodalDataset(config, transforms)
-    val_dataset = MultimodalDataset(config, val_transforms, ds_type="val")
+    train_dataset = MultimodalDataset(config, transforms, n_rows=n_rows)
+    val_dataset = MultimodalDataset(config, val_transforms, ds_type="test", n_rows=n_rows)
     train_loader = DataLoader(train_dataset,
                               batch_size=config.BATCH_SIZE,
                               shuffle=True,
@@ -121,14 +128,9 @@ def train(config, device):
                                                tokenizer=tokenizer))
 
     # инициализируем метрику
-    f1_metric_train = torchmetrics.F1Score(
-        task="binary" if config.NUM_CLASSES == 2 else "multiclass",
-        num_classes=config.NUM_CLASSES).to(device)
-    f1_metric_val = torchmetrics.F1Score(
-        task="binary" if config.NUM_CLASSES == 2 else "multiclass",
-        num_classes=config.NUM_CLASSES).to(device)
-    # best_f1_train = 0.0
-    best_f1_val = 0.0
+    mae_metric_train = torchmetrics.MeanAbsoluteError().to(device)
+    mae_metric_val = torchmetrics.MeanAbsoluteError().to(device)
+    best_mae_val = float('inf')
 
     print("training started")
     for epoch in range(config.EPOCHS):
@@ -140,14 +142,16 @@ def train(config, device):
             inputs = {
                 'input_ids': batch['input_ids'].to(device),
                 'attention_mask': batch['attention_mask'].to(device),
-                'image': batch['image'].to(device)
+                'image': batch['image'].to(device),
+                'mass': batch['mass'].unsqueeze(1).to(device),
+                "text_id": batch['text_id'].to(device)
             }
-            labels = batch['label'].to(device)
+            targets = batch['target'].unsqueeze(1).to(device)
 
             # Forward
             optimizer.zero_grad()
-            logits = model(**inputs)
-            loss = criterion(logits, labels)
+            predicts = model(**inputs)
+            loss = criterion(predicts, targets)
 
             # Backward
             loss.backward()
@@ -155,26 +159,27 @@ def train(config, device):
 
             total_loss += loss.item()
 
-            predicted = logits.argmax(dim=1)
-            _ = f1_metric_train(preds=predicted, target=labels)
+            _ = mae_metric_train(preds=predicts, target=targets)
 
         # Валидация
-        train_f1 = f1_metric_train.compute().cpu().numpy()
-        val_f1 = validate(model, val_loader, device, f1_metric_val)
-        f1_metric_val.reset()
-        f1_metric_train.reset()
+        train_mae = mae_metric_train.compute().cpu().numpy()
+        val_mae = validate(model, val_loader, device, mae_metric_val)
+        mae_metric_val.reset()
+        mae_metric_train.reset()
 
         print(
-            f"{datetime.now()} Epoch {epoch}/{config.EPOCHS-1} | avg_Loss: {total_loss/len(train_loader):.4f} | Train F1: {train_f1 :.4f}| Val F1: {val_f1 :.4f}"
+            f"{datetime.now()} Epoch {epoch}/{config.EPOCHS-1} | avg_Loss: {total_loss/len(train_loader):.4f} | Train MAE: {train_mae :.4f}| Val MAE: {val_mae :.4f}"
         )
 
-        if val_f1 > best_f1_val:
+        if val_mae < best_mae_val:
             print(f"Save best model, epoch: {epoch}")
-            best_f1_val = val_f1
+            best_mae_val = val_mae
             torch.save(model.state_dict(), config.SAVE_PATH)
+        if val_mae < config.TARGET_MAE:
+            break
+    print("Train ended")
 
-
-def validate(model, val_loader, device, f1_metric):
+def validate(model, val_loader, device, metric):
     model.eval()
 
     with torch.no_grad():
@@ -182,12 +187,13 @@ def validate(model, val_loader, device, f1_metric):
             inputs = {
                 'input_ids': batch['input_ids'].to(device),
                 'attention_mask': batch['attention_mask'].to(device),
-                'image': batch['image'].to(device)
+                'image': batch['image'].to(device),
+                'mass': batch['mass'].unsqueeze(1).to(device),
+                "text_id": batch['text_id'].to(device)
             }
-            labels = batch['label'].to(device)
+            targets = batch['target'].unsqueeze(1).to(device)
 
-            logits = model(**inputs)
-            predicted = logits.argmax(dim=1)
-            _ = f1_metric(preds=predicted, target=labels)
+            predicts = model(**inputs)
+            _ = metric(preds=predicts, target=targets)
 
-    return f1_metric.compute().cpu().numpy()
+    return metric.compute().cpu().numpy()
